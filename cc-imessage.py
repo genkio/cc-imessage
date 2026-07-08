@@ -69,9 +69,8 @@ CONFIG_TEMPLATE = """\
 PHONE=""
 # outbound: text a summary on each reply (1=on 0=off)
 IMSG_OUT=1
-# summarize replies longer than IMSG_SUMMARIZE_MIN chars via `claude -p haiku`
+# rewrite every reply for text-to-speech via `claude -p haiku` (1=on 0=off)
 IMSG_SUMMARIZE=1
-IMSG_SUMMARIZE_MIN=400
 # inbound poll cadence, seconds
 IMSG_POLL_INTERVAL=1.5
 # route non-reply phone messages to the last active session (1=on 0=off)
@@ -79,11 +78,18 @@ IMSG_FALLBACK_LAST=1
 """
 
 SUMMARY_PROMPT = (
-    "Rewrite this AI coding assistant reply as a short phone notification I can "
-    "read at a glance. At most 4 short sentences, plain English, no markdown or "
-    "URLs. Cover what was done or found, key numbers or decisions, and anything I "
-    "must do next. Lines like 'code block skipped' mean code is shown in the "
-    "terminal; mention it only if it matters."
+    "Rewrite this AI coding assistant reply as a short update that will be READ "
+    "ALOUD by a phone's text-to-speech. The listener has no screen. Use plain "
+    "spoken English, the way you'd tell a colleague over the phone. At most 4 "
+    "short sentences. Cover what was done or found, key decisions or numbers, and "
+    "anything I must do next. "
+    "Do NOT output code, file paths, command lines, flags, URLs, or symbol-laden "
+    "identifiers (anything with @ / _ . or camelCase) - spoken aloud they are "
+    "gibberish. If such a detail matters, paraphrase it in ordinary words rather "
+    "than quoting the literal token: say 'the vec0 dynamic library' not "
+    "'@rpath/vec0.dylib', 'the Homebrew formula' not 'formula.rb'. Say numbers "
+    "naturally. Lines like 'code block skipped' mean code is shown in the "
+    "terminal; refer to it only if it matters, and never reproduce it."
 )
 
 SEND_APPLESCRIPT = """\
@@ -549,7 +555,7 @@ def cmd_notify(args) -> int:
     speech = strip_markdown(text)
     if not speech:
         return 0
-    if cfg.get("IMSG_SUMMARIZE", "1") == "1" and len(speech) > int(cfg.get("IMSG_SUMMARIZE_MIN", "400")):
+    if cfg.get("IMSG_SUMMARIZE", "1") == "1":
         speech = summarize(speech)
 
     # queue only; the daemon (which holds the TCC grants) sends + maps the guid
