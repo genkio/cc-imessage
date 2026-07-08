@@ -508,9 +508,15 @@ def process_outbox(handles: list[str]) -> None:
             log(f"send failed ({e.stderr.strip() if e.stderr else e}); dropping {f.name}")
             f.unlink(missing_ok=True)
             continue
-        guid = find_sent_guid(handles, body)
-        update_map(guid or "", req.get("target", ""))
+        # delivered once send returns -> remove now so a later failure (e.g. guid
+        # lookup denied when FDA is off) can't resend the same message every tick
         f.unlink(missing_ok=True)
+        try:
+            guid = find_sent_guid(handles, body)
+        except Exception as e:
+            guid = None
+            log(f"guid lookup failed ({e}); reply-thread mapping skipped, fallback still works")
+        update_map(guid or "", req.get("target", ""))
         log(f"sent outbox -> {req.get('target')} (guid={'yes' if guid else 'none'})")
 
 
