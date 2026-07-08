@@ -84,6 +84,8 @@ cc-imessage notify                   # outbound; reads Stop-hook JSON on stdin
 cc-imessage send --to +1555… --text "hi" [--target %12]
 cc-imessage poll [--handle +1555…]   # debug: print new inbound messages
 cc-imessage map                      # debug: print the guid -> pane map
+cc-imessage enable | disable         # flip outbound (IMSG_OUT); no restart needed
+cc-imessage status                   # outbound on/off + daemon state
 ```
 
 `send`/`poll` touch `chat.db`, so run them where FDA applies (the daemon's
