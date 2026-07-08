@@ -27,6 +27,8 @@ chat.db) and Automation control of Messages (send).
   cc-imessage send --to H --text T
   cc-imessage poll                # debug: print new inbound messages as JSON
   cc-imessage map                 # debug: print the guid -> pane map
+  cc-imessage enable|disable      # flip outbound (IMSG_OUT) without editing config
+  cc-imessage status              # outbound on/off + daemon state
 """
 
 from __future__ import annotations
@@ -124,6 +126,22 @@ def load_config() -> dict:
 
 def config_handles(cfg: dict) -> list[str]:
     return [h.strip() for h in cfg.get("PHONE", "").split(",") if h.strip()]
+
+
+def set_config_value(key: str, value: str) -> None:
+    ensure_state()
+    lines = CONFIG.read_text().splitlines()
+    out, found = [], False
+    for line in lines:
+        s = line.strip()
+        if not s.startswith("#") and "=" in s and s.split("=", 1)[0].strip() == key:
+            out.append(f"{key}={value}")
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        out.append(f"{key}={value}")
+    CONFIG.write_text("\n".join(out) + "\n")
 
 
 def connect() -> sqlite3.Connection:
@@ -601,6 +619,30 @@ def cmd_map(args) -> int:
     return 0
 
 
+def cmd_enable(args) -> int:
+    # IMSG_OUT gates notify, read fresh each reply, so this needs no restart
+    set_config_value("IMSG_OUT", "1")
+    print("outbound enabled")
+    return 0
+
+
+def cmd_disable(args) -> int:
+    set_config_value("IMSG_OUT", "0")
+    print("outbound disabled (summaries + Haiku both skipped)")
+    return 0
+
+
+def cmd_status(args) -> int:
+    ensure_state()
+    cfg = load_config()
+    handles = config_handles(cfg)
+    running = subprocess.run(["pgrep", "-f", "cc-imessage run"], capture_output=True).returncode == 0
+    print(f"outbound: {'on' if cfg.get('IMSG_OUT', '1') == '1' else 'off'}")
+    print(f"handles:  {', '.join(handles) if handles else '(none set)'}")
+    print(f"daemon:   {'running' if running else 'not running'}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cc-imessage", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -625,6 +667,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     mp = sub.add_parser("map", help="debug: print the guid -> pane map")
     mp.set_defaults(func=cmd_map)
+
+    sub.add_parser("enable", help="turn outbound summaries on").set_defaults(func=cmd_enable)
+    sub.add_parser("disable", help="turn outbound summaries off").set_defaults(func=cmd_disable)
+    sub.add_parser("status", help="show outbound on/off + daemon state").set_defaults(func=cmd_status)
     return p
 
 
