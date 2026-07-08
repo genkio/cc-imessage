@@ -51,7 +51,9 @@ Or clone this repo and run the script directly (see Usage).
 
 1. **Full Disk Access** for whatever runs the daemon, so it can read `chat.db`:
    System Settings > Privacy & Security > Full Disk Access. For `brew services`
-   (launchd) add `/usr/bin/python3`; for a foreground run add your terminal app.
+   (launchd) add the python that runs the installed command, shown by
+   `head -1 "$(brew --prefix)/bin/cc-imessage"` (add its `readlink -f` target too
+   if the grant won't stick); for a foreground run add your terminal app instead.
 2. **Config.** First run seeds `~/.cc-imessage/config`. Set `PHONE` to your
    iPhone's iMessage handle in E.164 (`+15551234567`).
 3. **Outbound hook.** Add a Claude Code Stop hook so each session notifies you:
