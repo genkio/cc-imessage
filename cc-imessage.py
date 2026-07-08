@@ -5,18 +5,24 @@ You run many Claude Code sessions, each in its own tmux pane. This closes the
 loop between them and your phone:
 
   notify  (outbound) A Stop hook pipes its JSON in. We pull the session's final
-          reply, summarize it with Haiku, text it to your phone tagged
-          [session:window], and remember the sent message's guid -> that pane.
-  run     (inbound)  A daemon polls Messages for your replies. Each reply you
-          make (long-press -> Reply) carries the guid of what it answered, so we
-          look up the pane and inject your text (plus any image paths) with
-          tmux send-keys. Non-reply messages fall back to the last active pane.
+          reply, summarize it with Haiku, and queue an outbox request tagged
+          [session:window]. The daemon does the actual send + guid capture.
+  run     (inbound + sender) A daemon that (a) sends queued outbox requests via
+          Messages and records the sent guid -> the tmux pane, and (b) polls for
+          your replies and injects them (plus image paths) with tmux send-keys.
+          A reply carries the guid of the message it answers, so it routes back
+          to the exact pane; non-reply messages fall back to the last active one.
 
-Self-contained and stdlib only: reads chat.db read-only, sends through
-AppleScript, routes through tmux. macOS; the launching process needs Full Disk
-Access to read chat.db.
+Why the split: reading chat.db and controlling Messages need TCC permissions
+that macOS grants per code identity. Only the launchd-run daemon is its own
+responsible process, so it holds them. `notify` runs under Claude Code (a
+different responsible process) and would be denied, so it only summarizes and
+queues - no chat.db, no AppleScript. All privileged work lives in the daemon.
 
-  cc-imessage run                 # inbound daemon (brew services runs this)
+Self-contained, stdlib only. macOS; the daemon needs Full Disk Access (read
+chat.db) and Automation control of Messages (send).
+
+  cc-imessage run                 # daemon (brew services runs this)
   cc-imessage notify              # outbound; reads Stop-hook JSON on stdin
   cc-imessage send --to H --text T
   cc-imessage poll                # debug: print new inbound messages as JSON
@@ -44,16 +50,20 @@ CONFIG = STATE_DIR / "config"
 STATE = STATE_DIR / "state.json"
 MAP = STATE_DIR / "threadmap.json"
 LOCK = STATE_DIR / "threadmap.lock"
+OUTBOX = STATE_DIR / "outbox"
 CHAT_DB = HOME / "Library" / "Messages" / "chat.db"
 APPLE_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
 
 MAP_CAP = 1000            # cap guid->pane map so it can't grow without bound
 LAST_KEY = "__last__"     # fallback pane for non-reply messages
 SKIP_ENV = "CC_IMESSAGE_SKIP"  # set on the nested summarizer so its Stop no-ops
+OUTBOX_MAX_AGE = 300      # drop an unsendable outbox request after this many secs
 
 CONFIG_TEMPLATE = """\
-# cc-imessage config. Fill PHONE with your iPhone's iMessage handle in E.164,
-# e.g. +15551234567 (or an Apple ID email). Empty PHONE = bridge disabled.
+# cc-imessage config. PHONE is your phone's iMessage handle(s) as the Mac sees
+# them. Comma-separate if your phone texts arrive under more than one address
+# (e.g. both a number and an email): PHONE="+15551234567,you@icloud.com".
+# The first entry is used as the send target. Empty = bridge disabled.
 PHONE=""
 # outbound: text a summary on each reply (1=on 0=off)
 IMSG_OUT=1
@@ -94,6 +104,7 @@ def log(msg: str) -> None:
 
 def ensure_state() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    OUTBOX.mkdir(parents=True, exist_ok=True)
     if not CONFIG.exists():
         CONFIG.write_text(CONFIG_TEMPLATE)
         log(f"seeded {CONFIG} - set PHONE in it")
@@ -111,12 +122,19 @@ def load_config() -> dict:
     return cfg
 
 
+def config_handles(cfg: dict) -> list[str]:
+    return [h.strip() for h in cfg.get("PHONE", "").split(",") if h.strip()]
+
+
 def connect() -> sqlite3.Connection:
     if not CHAT_DB.exists():
         sys.exit(f"chat.db not found at {CHAT_DB}. Run on the Mac whose Messages "
                  f"you want, with Full Disk Access granted.")
     try:
-        conn = sqlite3.connect(f"file:{CHAT_DB}?mode=ro&immutable=1", uri=True)
+        # mode=ro (not immutable): chat.db is WAL, and immutable=1 serves a frozen
+        # snapshot that misses rows still in the write-ahead log until a checkpoint,
+        # which made routing lag by minutes. ro reads committed WAL live.
+        conn = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True)
     except sqlite3.OperationalError as e:
         sys.exit(f"could not open chat.db ({e}). Grant Full Disk Access.")
     conn.row_factory = sqlite3.Row
@@ -212,23 +230,31 @@ def save_last_rowid(rowid: int) -> None:
     STATE.write_text(json.dumps({"last_rowid": rowid}))
 
 
-def poll_new(phone: str, convert_heic: bool = True) -> list[dict]:
-    """Inbound messages from `phone` newer than last poll. First run baselines at now."""
+def _handle_in_clause(handles: list[str]) -> tuple[str, list[str]]:
+    return ",".join("?" * len(handles)), list(handles)
+
+
+def poll_new(handles: list[str], convert_heic: bool = True) -> list[dict]:
+    """Inbound messages from any configured handle, newer than last poll.
+
+    First run baselines at now so history isn't replayed.
+    """
     conn = connect()
     last = load_last_rowid()
     if last is None:
         last = conn.execute("SELECT MAX(ROWID) AS m FROM message").fetchone()["m"] or 0
         save_last_rowid(last)
         return []
+    placeholders, hp = _handle_in_clause(handles)
     rows = conn.execute(
-        """
+        f"""
         SELECT m.ROWID AS rowid, m.guid, m.text, m.attributedBody, m.date,
                m.cache_has_attachments, m.thread_originator_guid, h.id AS handle
         FROM message m
         LEFT JOIN handle h ON h.ROWID = m.handle_id
-        WHERE m.ROWID > ? AND m.is_from_me = 0 AND h.id = ?
+        WHERE m.ROWID > ? AND m.is_from_me = 0 AND h.id IN ({placeholders})
         ORDER BY m.ROWID ASC
-        """, (last, phone)).fetchall()
+        """, [last, *hp]).fetchall()
     msgs = []
     for r in rows:
         atts = resolve_attachments(conn, r["rowid"], convert_heic) if r["cache_has_attachments"] else []
@@ -250,36 +276,31 @@ def _applescript_path() -> str:
     return str(p)
 
 
-def imessage_send(handle: str, text: str) -> None:
+def imessage_send(handle: str, text: str, timeout: float = 30.0) -> None:
+    # timeout so a pending Automation-consent prompt can't hang the daemon forever
     subprocess.run(["osascript", _applescript_path(), handle, text],
-                   check=True, capture_output=True, text=True)
+                   check=True, capture_output=True, text=True, timeout=timeout)
 
 
-def find_sent_guid(handle: str, text: str, timeout: float = 3.0) -> str | None:
+def find_sent_guid(handles: list[str], text: str, timeout: float = 3.0) -> str | None:
     """The row we just sent appears in chat.db a beat later; return its guid."""
+    placeholders, hp = _handle_in_clause(handles)
     deadline = time.time() + timeout
     while time.time() < deadline:
         conn = connect()
         rows = conn.execute(
-            """
+            f"""
             SELECT m.guid, m.text, m.attributedBody
             FROM message m LEFT JOIN handle h ON h.ROWID = m.handle_id
-            WHERE m.is_from_me = 1 AND h.id = ?
-            ORDER BY m.ROWID DESC LIMIT 5
-            """, (handle,)).fetchall()
+            WHERE m.is_from_me = 1 AND h.id IN ({placeholders})
+            ORDER BY m.ROWID DESC LIMIT 8
+            """, hp).fetchall()
         conn.close()
         for r in rows:
             if (message_text(r) or "") == text:
                 return r["guid"]
         time.sleep(0.3)
     return None
-
-
-def send_and_map(phone: str, body: str, target: str) -> str | None:
-    imessage_send(phone, body)
-    guid = find_sent_guid(phone, body)
-    update_map(guid or "", target)
-    return guid
 
 
 def _read_map() -> dict:
@@ -434,6 +455,42 @@ def summarize(text: str, timeout: float = 30.0) -> str:
         return text
 
 
+def queue_outbox(target: str, label: str, text: str) -> None:
+    OUTBOX.mkdir(parents=True, exist_ok=True)
+    # time_ns name keeps outbox processing in send order
+    path = OUTBOX / f"{time.time_ns()}-{os.getpid()}.json"
+    path.write_text(json.dumps({"target": target, "label": label, "text": text}))
+
+
+def process_outbox(handles: list[str]) -> None:
+    """Daemon side of outbound: send each queued request and map guid -> pane."""
+    if not handles:
+        return
+    for f in sorted(OUTBOX.glob("*.json")):
+        try:
+            req = json.loads(f.read_text())
+        except Exception:
+            f.unlink(missing_ok=True)
+            continue
+        body = f"[{req.get('label', 'cc')}] {req.get('text', '')}"
+        try:
+            imessage_send(handles[0], body)
+        except subprocess.TimeoutExpired:
+            # consent prompt likely pending; retry next tick until it ages out
+            if time.time() - f.stat().st_mtime > OUTBOX_MAX_AGE:
+                log(f"outbox {f.name} timed out too long; dropping")
+                f.unlink(missing_ok=True)
+            continue
+        except subprocess.CalledProcessError as e:
+            log(f"send failed ({e.stderr.strip() if e.stderr else e}); dropping {f.name}")
+            f.unlink(missing_ok=True)
+            continue
+        guid = find_sent_guid(handles, body)
+        update_map(guid or "", req.get("target", ""))
+        f.unlink(missing_ok=True)
+        log(f"sent outbox -> {req.get('target')} (guid={'yes' if guid else 'none'})")
+
+
 def cmd_notify(args) -> int:
     # nested summarizer's own Stop hook -> do nothing (would recurse)
     if os.environ.get(SKIP_ENV):
@@ -448,8 +505,7 @@ def cmd_notify(args) -> int:
         return 0
 
     cfg = load_config()
-    phone = cfg.get("PHONE", "")
-    if not phone or cfg.get("IMSG_OUT", "1") != "1":
+    if not config_handles(cfg) or cfg.get("IMSG_OUT", "1") != "1":
         return 0
     target = os.environ.get("TMUX_PANE")
     if not target:  # no pane -> a reply couldn't be routed back anyway
@@ -467,44 +523,39 @@ def cmd_notify(args) -> int:
     if cfg.get("IMSG_SUMMARIZE", "1") == "1" and len(speech) > int(cfg.get("IMSG_SUMMARIZE_MIN", "400")):
         speech = summarize(speech)
 
-    body = f"[{tmux_label(target)}] {speech}"
-    try:
-        guid = send_and_map(phone, body, target)
-    except subprocess.CalledProcessError as e:
-        log(f"send failed: {e.stderr.strip() if e.stderr else e}")
-        return 1
-    if not guid:
-        log("sent but no guid; only fallback routing will work for this one")
+    # queue only; the daemon (which holds the TCC grants) sends + maps the guid
+    queue_outbox(target, tmux_label(target), speech)
     return 0
 
 
 def cmd_run(args) -> int:
     ensure_state()
     cfg = load_config()
-    phone = cfg.get("PHONE", "")
+    handles = config_handles(cfg)
     interval = float(cfg.get("IMSG_POLL_INTERVAL", "1.5"))
     use_fallback = cfg.get("IMSG_FALLBACK_LAST", "1") == "1"
-    if not phone:
-        log("PHONE not set in config; poller idle. Set it and restart the service.")
-    log(f"cc-imessage poller up (interval={interval}s, fallback={'on' if use_fallback else 'off'})")
+    if not handles:
+        log("PHONE not set in config; daemon idle. Set it and restart the service.")
+    log(f"cc-imessage daemon up (handles={handles or 'none'}, "
+        f"interval={interval}s, fallback={'on' if use_fallback else 'off'})")
 
     fails = 0
     while True:
         ok = True
         try:
-            if phone:
-                _tick(phone, use_fallback)
+            if handles:
+                process_outbox(handles)
+                _tick(handles, use_fallback)
         except Exception as e:
             log(f"tick error: {e}")
             ok = False
-        # back off on repeated failure (e.g. Full Disk Access not granted yet)
         fails = 0 if ok else fails + 1
         time.sleep(interval if fails == 0 else min(interval * 2 ** fails, 30))
 
 
-def _tick(phone: str, use_fallback: bool) -> None:
+def _tick(handles: list[str], use_fallback: bool) -> None:
     m = _read_map()
-    for msg in poll_new(phone, convert_heic=True):
+    for msg in poll_new(handles, convert_heic=True):
         guid = msg.get("reply_to_guid")
         target = m.get(guid) if guid else (m.get(LAST_KEY) if use_fallback else None)
         if not target:
@@ -519,21 +570,24 @@ def _tick(phone: str, use_fallback: bool) -> None:
 
 def cmd_send(args) -> int:
     ensure_state()
-    imessage_send(args.to, args.text)
-    guid = find_sent_guid(args.to, args.text)
+    handles = [args.to] if args.to else config_handles(load_config())
+    if not handles:
+        sys.exit("no handle: pass --to or set PHONE in config")
+    body = args.text
+    imessage_send(handles[0], body)
+    guid = find_sent_guid(handles, body)
     if args.target:
         update_map(guid or "", args.target)
-    print(json.dumps({"sent": True, "to": args.to, "guid": guid}))
+    print(json.dumps({"sent": True, "to": handles[0], "guid": guid}))
     return 0
 
 
 def cmd_poll(args) -> int:
     ensure_state()
-    cfg = load_config()
-    phone = args.handle or cfg.get("PHONE", "")
-    if not phone:
+    handles = [args.handle] if args.handle else config_handles(load_config())
+    if not handles:
         sys.exit("no handle: pass --handle or set PHONE in config")
-    print(json.dumps(poll_new(phone, convert_heic=args.convert_heic), indent=2))
+    print(json.dumps(poll_new(handles, convert_heic=args.convert_heic), indent=2))
     return 0
 
 
@@ -547,14 +601,14 @@ def build_parser() -> argparse.ArgumentParser:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
 
-    r = sub.add_parser("run", help="inbound daemon: poll iMessage and inject into tmux")
+    r = sub.add_parser("run", help="daemon: send queued outbox + inject phone replies into tmux")
     r.set_defaults(func=cmd_run)
 
-    n = sub.add_parser("notify", help="outbound: read Stop-hook JSON on stdin, text a summary")
+    n = sub.add_parser("notify", help="outbound: read Stop-hook JSON on stdin, queue a summary")
     n.set_defaults(func=cmd_notify)
 
     s = sub.add_parser("send", help="send an iMessage; prints the sent guid")
-    s.add_argument("--to", required=True)
+    s.add_argument("--to")
     s.add_argument("--text", required=True)
     s.add_argument("--target", help="tmux pane to map the guid to (for reply routing)")
     s.set_defaults(func=cmd_send)
