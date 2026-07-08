@@ -239,33 +239,38 @@ def poll_new(handles: list[str], convert_heic: bool = True) -> list[dict]:
 
     First run baselines at now so history isn't replayed.
     """
+    # close every tick: mode=ro on a WAL db opens db+wal+shm fds, so a leaked
+    # connection per poll exhausts the fd limit in ~2 min and wedges the daemon
     conn = connect()
-    last = load_last_rowid()
-    if last is None:
-        last = conn.execute("SELECT MAX(ROWID) AS m FROM message").fetchone()["m"] or 0
-        save_last_rowid(last)
-        return []
-    placeholders, hp = _handle_in_clause(handles)
-    rows = conn.execute(
-        f"""
-        SELECT m.ROWID AS rowid, m.guid, m.text, m.attributedBody, m.date,
-               m.cache_has_attachments, m.thread_originator_guid, h.id AS handle
-        FROM message m
-        LEFT JOIN handle h ON h.ROWID = m.handle_id
-        WHERE m.ROWID > ? AND m.is_from_me = 0 AND h.id IN ({placeholders})
-        ORDER BY m.ROWID ASC
-        """, [last, *hp]).fetchall()
-    msgs = []
-    for r in rows:
-        atts = resolve_attachments(conn, r["rowid"], convert_heic) if r["cache_has_attachments"] else []
-        msgs.append({
-            "rowid": r["rowid"], "guid": r["guid"], "handle": r["handle"],
-            "text": message_text(r), "date": apple_time_to_iso(r["date"]),
-            "reply_to_guid": r["thread_originator_guid"], "attachments": atts,
-        })
-    new_max = max([last] + [r["rowid"] for r in rows]) if rows else last
-    save_last_rowid(new_max)
-    return msgs
+    try:
+        last = load_last_rowid()
+        if last is None:
+            last = conn.execute("SELECT MAX(ROWID) AS m FROM message").fetchone()["m"] or 0
+            save_last_rowid(last)
+            return []
+        placeholders, hp = _handle_in_clause(handles)
+        rows = conn.execute(
+            f"""
+            SELECT m.ROWID AS rowid, m.guid, m.text, m.attributedBody, m.date,
+                   m.cache_has_attachments, m.thread_originator_guid, h.id AS handle
+            FROM message m
+            LEFT JOIN handle h ON h.ROWID = m.handle_id
+            WHERE m.ROWID > ? AND m.is_from_me = 0 AND h.id IN ({placeholders})
+            ORDER BY m.ROWID ASC
+            """, [last, *hp]).fetchall()
+        msgs = []
+        for r in rows:
+            atts = resolve_attachments(conn, r["rowid"], convert_heic) if r["cache_has_attachments"] else []
+            msgs.append({
+                "rowid": r["rowid"], "guid": r["guid"], "handle": r["handle"],
+                "text": message_text(r), "date": apple_time_to_iso(r["date"]),
+                "reply_to_guid": r["thread_originator_guid"], "attachments": atts,
+            })
+        new_max = max([last] + [r["rowid"] for r in rows]) if rows else last
+        save_last_rowid(new_max)
+        return msgs
+    finally:
+        conn.close()
 
 
 def _applescript_path() -> str:
