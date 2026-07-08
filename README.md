@@ -9,77 +9,94 @@ land back in the right tmux pane as if you had typed them.
 
 ## How it works
 
-Two directions, each picked for what it does best:
+Two subcommands, split by the macOS permissions each needs:
 
-- **Outbound (`notify`).** A Claude Code Stop hook pipes its JSON to
-  `cc-imessage notify`. We read the session's final reply from the transcript,
-  strip code/tables, summarize it with `claude -p --model haiku`, and text it to
-  your phone tagged `[session:window]`. The sent message's `guid` is recorded
-  against the tmux pane it came from.
-- **Inbound (`run`).** A daemon polls the Messages database (`chat.db`,
-  read-only) for your replies. When you long-press a summary and tap **Reply**,
-  that reply carries the `guid` of what it answered, so we look up the pane and
-  inject your text with `tmux send-keys`. No prefixes to type. Image attachments
-  are resolved on disk (HEIC converted to PNG) and their paths are injected so
-  Claude Code attaches them.
+- **`notify`** (outbound, runs as a Claude Code Stop hook). Reads the session's
+  final reply from the transcript, strips code/tables, summarizes it with
+  `claude -p --model haiku`, and queues a request tagged `[session:window]`. It
+  needs no special permissions, so it works even though Claude Code isn't the
+  process macOS granted access to.
+- **`run`** (the daemon, started by `brew services`). Holds the permissions and
+  does the privileged work: it (a) sends queued requests via Messages and records
+  each sent message's `guid` against the tmux pane it came from, and (b) polls
+  `chat.db` for your replies and injects them with `tmux send-keys`.
 
-Routing is by reply-thread, so several sessions can ping you at once and each
-reply lands where you were actually responding. A message that isn't a reply
-falls back to the last active session (toggleable).
+When you long-press a summary and tap **Reply**, that reply carries the `guid` of
+what it answered, so it routes back to the exact pane, no prefixes to type. A
+message that isn't a reply falls back to the last active session (toggleable).
+Image attachments are resolved on disk (HEIC converted to PNG) and their paths
+injected so Claude Code attaches them.
 
-Because the Mac and phone use separate iMessage accounts, your commands arrive
-as received (`is_from_me = 0`) and are cleanly separated from the summaries the
-Mac sent.
+The Mac and the phone must use **separate iMessage accounts** (e.g. Mac on an
+iCloud address, phone on a different Apple ID). That way your texts to the Mac
+arrive as received (`is_from_me = 0`) and are cleanly separated from the
+summaries the Mac sends.
 
 ## Install
 
-Homebrew, no clone needed:
-
 ```sh
 brew install genkio/tap/cc-imessage
+brew services start genkio/tap/cc-imessage   # the daemon
 ```
 
-Then:
+### Required setup (one time)
 
-```sh
-brew services start genkio/tap/cc-imessage   # inbound daemon in the background
-```
-
-Or clone this repo and run the script directly (see Usage).
-
-### Required setup
-
-1. **Full Disk Access** for whatever runs the daemon, so it can read `chat.db`:
-   System Settings > Privacy & Security > Full Disk Access. For `brew services`
-   (launchd) add the python that runs the installed command, shown by
-   `head -1 "$(brew --prefix)/bin/cc-imessage"` (add its `readlink -f` target too
-   if the grant won't stick); for a foreground run add your terminal app instead.
-2. **Config.** First run seeds `~/.cc-imessage/config`. Set `PHONE` to your
-   iPhone's iMessage handle in E.164 (`+15551234567`).
-3. **Outbound hook.** Add a Claude Code Stop hook so each session notifies you:
+1. **Config.** First run seeds `~/.cc-imessage/config`. Set `PHONE` to how your
+   phone's iMessages arrive at the Mac, the address shown on the phone under
+   Settings > Messages > Send & Receive > "Start new conversations from" (a phone
+   number in E.164 like `+15551234567`, or an Apple ID email). If they can arrive
+   under more than one address, comma-separate them: `PHONE="+1555…,you@me.com"`.
+2. **Full Disk Access** so the daemon can read `chat.db`. Grant it to the binary
+   itself (its own code identity, nothing else inherits it):
+   `/opt/homebrew/opt/cc-imessage/bin/cc-imessage`
+   (System Settings > Privacy & Security > Full Disk Access > `+`, Cmd+Shift+G to
+   type the path).
+3. **Automation.** The first outbound send pops "cc-imessage wants to control
+   Messages", click **Allow**. That's the send permission, also scoped to the
+   binary.
+4. **Outbound hook.** Add a Claude Code Stop hook. The guard makes it a harmless
+   no-op on machines where cc-imessage isn't installed yet:
    ```json
    { "hooks": { "Stop": [ { "hooks": [
-     { "type": "command", "command": "cc-imessage notify" }
+     { "type": "command",
+       "command": "command -v cc-imessage >/dev/null 2>&1 && cc-imessage notify || true" }
    ] } ] } }
    ```
+
+Grants persist across `brew upgrade`: the binary is signed with a self-signed
+cert (see `scripts/make-signing-cert.sh`), so its designated requirement keys on
+the cert rather than the per-build hash. You grant FDA + Automation once per
+machine, not once per release.
+
+### Restoring on a new machine
+
+Safe to restore your dotfiles (with the Stop hook) before installing cc-imessage.
+Until it's installed the hook is a no-op (the `command -v` guard); once installed
+but not yet configured, `notify` returns early (no `PHONE`). Nothing queues or
+errors in the meantime, no backlog builds up. Outbound simply starts working for
+new replies once you finish the setup above; inbound needs `brew services start`.
 
 ## Usage
 
 ```sh
-cc-imessage run                     # inbound daemon, foreground
-cc-imessage notify                  # outbound; reads Stop-hook JSON on stdin
-cc-imessage send --to +1555... --text "hi" [--target %12]
-cc-imessage poll [--handle +1555...] # debug: print new inbound messages
-cc-imessage map                     # debug: print the guid -> pane map
+cc-imessage run                      # daemon, foreground
+cc-imessage notify                   # outbound; reads Stop-hook JSON on stdin
+cc-imessage send --to +1555… --text "hi" [--target %12]
+cc-imessage poll [--handle +1555…]   # debug: print new inbound messages
+cc-imessage map                      # debug: print the guid -> pane map
 ```
 
-Make targets wrap the script:
+`send`/`poll` touch `chat.db`, so run them where FDA applies (the daemon's
+context); from a plain shell they'll be denied unless that shell has FDA.
+
+Make targets wrap the script for local runs:
 
 ```sh
+make build    # compile the standalone binary (signs it if the cert exists)
 make run      # daemon; append to ~/.cc-imessage/bridge.log, open lnav if present
-make poll     # print new inbound messages
-make map      # print the routing map
-make send TO=+1555... TEXT="hi"
+make poll
+make map
+make send TO=+1555… TEXT="hi"
 ```
 
 ## Config
@@ -88,8 +105,8 @@ make send TO=+1555... TEXT="hi"
 
 | key | default | meaning |
 |-----|---------|---------|
-| `PHONE` | (empty) | your iMessage handle; empty disables the bridge |
-| `IMSG_OUT` | 1 | send a summary on each reply |
+| `PHONE` | (empty) | your phone's handle(s), comma-separated; empty disables the bridge |
+| `IMSG_OUT` | 1 | send a summary on each reply (0 disables outbound; takes effect next reply, no restart) |
 | `IMSG_SUMMARIZE` | 1 | summarize replies over the threshold with Haiku |
 | `IMSG_SUMMARIZE_MIN` | 400 | char threshold for summarizing |
 | `IMSG_POLL_INTERVAL` | 1.5 | inbound poll cadence, seconds |
@@ -98,10 +115,9 @@ make send TO=+1555... TEXT="hi"
 ## Limitations
 
 - macOS only, tmux only. Sessions outside tmux can't be routed to.
-- Full Disk Access is the usual reason reads fail; grant it to the process that
-  runs the daemon (the interpreter under launchd, or your terminal).
+- Prebuilt binary is arm64; on Intel, `make build` (needs the signing cert for
+  persistent grants, else it's left adhoc).
 - Text extraction covers ordinary messages; rich/edited messages may need
   `imessage-exporter` for perfect fidelity.
-- Sends via AppleScript; the `buddy` form works on most macOS versions. If it
-  errors, use the full E.164 handle and make sure the recipient is a known
-  iMessage contact.
+- Sends via AppleScript; if it errors, use the full E.164 handle and make sure
+  the recipient is a known iMessage contact.
