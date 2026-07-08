@@ -1,7 +1,15 @@
-.PHONY: run poll map send
+.PHONY: run poll map send build
 .DEFAULT_GOAL := run
 
 LOG := $(HOME)/.cc-imessage/bridge.log
+
+# Compile to a standalone binary so it has its own code identity -> Full Disk
+# Access can be granted to just cc-imessage, not the shared python.
+build:
+	python3 -m venv build/venv
+	build/venv/bin/pip install -q --upgrade pip pyinstaller
+	build/venv/bin/pyinstaller --onefile --name cc-imessage --clean --noconfirm cc-imessage.py
+	@echo "binary -> dist/cc-imessage"
 
 run:
 	@if command -v lnav >/dev/null 2>&1; then \
