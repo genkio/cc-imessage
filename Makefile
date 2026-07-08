@@ -12,8 +12,7 @@ build:
 	python3 -m venv build/venv
 	build/venv/bin/pip install -q --upgrade pip pyinstaller
 	build/venv/bin/pyinstaller --onefile --name cc-imessage --clean --noconfirm cc-imessage.py
-	@if security find-identity -v 2>/dev/null | grep -q "$(SIGN_ID)"; then \
-		codesign --force --sign "$(SIGN_ID)" --identifier com.genkio.cc-imessage dist/cc-imessage && \
+	@if codesign --force --sign "$(SIGN_ID)" --identifier com.genkio.cc-imessage dist/cc-imessage 2>/dev/null; then \
 		echo "signed dist/cc-imessage with $(SIGN_ID)"; \
 	else \
 		echo "no '$(SIGN_ID)' identity; dist/cc-imessage left adhoc (TCC grants won't persist across upgrades)"; \
