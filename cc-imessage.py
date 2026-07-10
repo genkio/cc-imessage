@@ -19,7 +19,19 @@ responsible process, so it holds them. `notify` runs under Claude Code (a
 different responsible process) and would be denied, so it only summarizes and
 queues - no chat.db, no AppleScript. All privileged work lives in the daemon.
 
-Self-contained, stdlib only. macOS; the daemon needs Full Disk Access (read
+Why launchd runs ccim-launcher, not this binary: TCC grants die with each new
+code identity, and every release is a new identity (self-signed certs do not
+help; see HANDOVER). The frozen launcher binary is the launchd job and runs
+this daemon as a child, so privileged work is attributed to the launcher's
+never-changing identity. Grant FDA + Automation to the launcher once; upgrade
+this tool freely.
+
+The messaging medium is pluggable: a Transport provides send / find_sent_id /
+poll, and everything else (outbox, thread map, tmux inject, notify) is
+medium-agnostic. `imessage` is the default and only built-in today; a new
+medium means one new Transport class, no TCC involved.
+
+Self-contained, stdlib only. macOS; the launcher needs Full Disk Access (read
 chat.db) and Automation control of Messages (send).
 
   cc-imessage run                 # daemon (brew services runs this)
@@ -75,6 +87,8 @@ IMSG_SUMMARIZE=1
 IMSG_POLL_INTERVAL=1.5
 # route non-reply phone messages to the last active session (1=on 0=off)
 IMSG_FALLBACK_LAST=1
+# messaging medium (only "imessage" is built in today)
+CCIM_TRANSPORT=imessage
 """
 
 SUMMARY_PROMPT = (
@@ -332,6 +346,45 @@ def find_sent_guid(handles: list[str], text: str, timeout: float = 3.0) -> str |
     return None
 
 
+class IMessageTransport:
+    """Messaging-medium interface. A transport owns three things:
+
+    send(handle, text)            deliver one message
+    find_sent_id(handles, text)   the just-sent message's id, for reply threading
+    poll(handles)                 new inbound messages since the last poll (the
+                                  transport keeps its own cursor); each message is
+                                  {"guid", "reply_to_guid", "handle", "text",
+                                   "date", "attachments"} - guid is whatever id
+                                  the medium threads replies by
+
+    Everything else (outbox, id -> pane map, tmux inject, notify) never touches
+    the medium. iMessage is the only built-in; its send/poll need the TCC grants
+    held by the launcher. A non-Apple medium (e.g. a bot API) needs no grants.
+    """
+
+    name = "imessage"
+
+    def send(self, handle: str, text: str) -> None:
+        imessage_send(handle, text)
+
+    def find_sent_id(self, handles: list[str], text: str) -> str | None:
+        return find_sent_guid(handles, text)
+
+    def poll(self, handles: list[str], convert_heic: bool = True) -> list[dict]:
+        return poll_new(handles, convert_heic)
+
+
+TRANSPORTS = {"imessage": IMessageTransport}
+
+
+def get_transport(cfg: dict):
+    name = cfg.get("CCIM_TRANSPORT", "imessage")
+    cls = TRANSPORTS.get(name)
+    if cls is None:
+        sys.exit(f"unknown CCIM_TRANSPORT '{name}' (available: {', '.join(TRANSPORTS)})")
+    return cls()
+
+
 def _read_map() -> dict:
     try:
         return json.loads(MAP.read_text())
@@ -475,7 +528,10 @@ def strip_markdown(text: str) -> str:
 def summarize(text: str, timeout: float = 30.0) -> str:
     if not shutil.which("claude"):
         return text
-    env = dict(os.environ, **{SKIP_ENV: "1"})
+    # HERDLET_SKIP: the nested claude inherits the agent's TMUX_PANE/HERDLET_ID,
+    # and without it its SessionStart/SessionEnd hooks corrupt the agent's
+    # herdlet record (worst case: delete it)
+    env = dict(os.environ, **{SKIP_ENV: "1", "HERDLET_SKIP": "1"})
     try:
         r = subprocess.run(["claude", "-p", "--model", "haiku", SUMMARY_PROMPT],
                            input=text, text=True, capture_output=True, timeout=timeout, env=env)
@@ -491,7 +547,7 @@ def queue_outbox(target: str, label: str, text: str) -> None:
     path.write_text(json.dumps({"target": target, "label": label, "text": text}))
 
 
-def process_outbox(handles: list[str]) -> None:
+def process_outbox(transport, handles: list[str]) -> None:
     """Daemon side of outbound: send each queued request and map guid -> pane."""
     if not handles:
         return
@@ -503,7 +559,7 @@ def process_outbox(handles: list[str]) -> None:
             continue
         body = f"[{req.get('label', 'cc')}] {req.get('text', '')}"
         try:
-            imessage_send(handles[0], body)
+            transport.send(handles[0], body)
         except subprocess.TimeoutExpired:
             # consent prompt likely pending; retry next tick until it ages out
             if time.time() - f.stat().st_mtime > OUTBOX_MAX_AGE:
@@ -518,7 +574,7 @@ def process_outbox(handles: list[str]) -> None:
         # lookup denied when FDA is off) can't resend the same message every tick
         f.unlink(missing_ok=True)
         try:
-            guid = find_sent_guid(handles, body)
+            guid = transport.find_sent_id(handles, body)
         except Exception as e:
             guid = None
             log(f"guid lookup failed ({e}); reply-thread mapping skipped, fallback still works")
@@ -567,11 +623,12 @@ def cmd_run(args) -> int:
     ensure_state()
     cfg = load_config()
     handles = config_handles(cfg)
+    transport = get_transport(cfg)
     interval = float(cfg.get("IMSG_POLL_INTERVAL", "1.5"))
     use_fallback = cfg.get("IMSG_FALLBACK_LAST", "1") == "1"
     if not handles:
         log("PHONE not set in config; daemon idle. Set it and restart the service.")
-    log(f"cc-imessage daemon up (handles={handles or 'none'}, "
+    log(f"cc-imessage daemon up (transport={transport.name}, handles={handles or 'none'}, "
         f"interval={interval}s, fallback={'on' if use_fallback else 'off'})")
 
     fails = 0
@@ -579,8 +636,8 @@ def cmd_run(args) -> int:
         ok = True
         try:
             if handles:
-                process_outbox(handles)
-                _tick(handles, use_fallback)
+                process_outbox(transport, handles)
+                _tick(transport, handles, use_fallback)
         except Exception as e:
             log(f"tick error: {e}")
             ok = False
@@ -588,9 +645,9 @@ def cmd_run(args) -> int:
         time.sleep(interval if fails == 0 else min(interval * 2 ** fails, 30))
 
 
-def _tick(handles: list[str], use_fallback: bool) -> None:
+def _tick(transport, handles: list[str], use_fallback: bool) -> None:
     m = _read_map()
-    for msg in poll_new(handles, convert_heic=True):
+    for msg in transport.poll(handles):
         guid = msg.get("reply_to_guid")
         target = m.get(guid) if guid else (m.get(LAST_KEY) if use_fallback else None)
         if not target:
@@ -605,12 +662,14 @@ def _tick(handles: list[str], use_fallback: bool) -> None:
 
 def cmd_send(args) -> int:
     ensure_state()
-    handles = [args.to] if args.to else config_handles(load_config())
+    cfg = load_config()
+    handles = [args.to] if args.to else config_handles(cfg)
     if not handles:
         sys.exit("no handle: pass --to or set PHONE in config")
+    transport = get_transport(cfg)
     body = args.text
-    imessage_send(handles[0], body)
-    guid = find_sent_guid(handles, body)
+    transport.send(handles[0], body)
+    guid = transport.find_sent_id(handles, body)
     if args.target:
         update_map(guid or "", args.target)
     print(json.dumps({"sent": True, "to": handles[0], "guid": guid}))
@@ -619,10 +678,11 @@ def cmd_send(args) -> int:
 
 def cmd_poll(args) -> int:
     ensure_state()
-    handles = [args.handle] if args.handle else config_handles(load_config())
+    cfg = load_config()
+    handles = [args.handle] if args.handle else config_handles(cfg)
     if not handles:
         sys.exit("no handle: pass --handle or set PHONE in config")
-    print(json.dumps(poll_new(handles, convert_heic=args.convert_heic), indent=2))
+    print(json.dumps(get_transport(cfg).poll(handles, convert_heic=args.convert_heic), indent=2))
     return 0
 
 

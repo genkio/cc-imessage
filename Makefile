@@ -1,22 +1,23 @@
-.PHONY: run poll map send build
+.PHONY: run poll map send build build-launcher
 .DEFAULT_GOAL := run
 
 LOG := $(HOME)/.cc-imessage/bridge.log
-SIGN_ID ?= cc-imessage-selfsign
 
-# Compile to a standalone binary so it has its own code identity -> Full Disk
-# Access can be granted to just cc-imessage, not the shared python. Then sign
-# with a self-signed cert so the designated requirement keys on the cert
-# (stable) instead of the per-build cdhash -> TCC grants survive brew upgrades.
+# Standalone binary. Holds no TCC grants itself (ccim-launcher does), so no
+# signing needed; rebuild freely per release.
 build:
 	python3 -m venv build/venv
 	build/venv/bin/pip install -q --upgrade pip pyinstaller
 	build/venv/bin/pyinstaller --onefile --name cc-imessage --clean --noconfirm cc-imessage.py
-	@if codesign --force --sign "$(SIGN_ID)" --identifier com.genkio.cc-imessage dist/cc-imessage 2>/dev/null; then \
-		echo "signed dist/cc-imessage with $(SIGN_ID)"; \
-	else \
-		echo "no '$(SIGN_ID)' identity; dist/cc-imessage left adhoc (TCC grants won't persist across upgrades)"; \
-	fi
+
+# The frozen TCC anchor. Do NOT rebuild per release: new bytes = new code
+# identity = every user re-grants FDA + Automation. Build only when
+# ccim-launcher.py itself changes (bump its __version__), then cut a
+# launcher-vX.Y.Z release for the formula to pin.
+build-launcher:
+	python3 -m venv build/venv
+	build/venv/bin/pip install -q --upgrade pip pyinstaller
+	build/venv/bin/pyinstaller --onefile --name ccim-launcher --clean --noconfirm ccim-launcher.py
 
 run:
 	@if command -v lnav >/dev/null 2>&1; then \

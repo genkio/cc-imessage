@@ -16,10 +16,22 @@ Two subcommands, split by the macOS permissions each needs:
   `claude -p --model haiku`, and queues a request tagged `[session:window]`. It
   needs no special permissions, so it works even though Claude Code isn't the
   process macOS granted access to.
-- **`run`** (the daemon, started by `brew services`). Holds the permissions and
-  does the privileged work: it (a) sends queued requests via Messages and records
-  each sent message's `guid` against the tmux pane it came from, and (b) polls
-  `chat.db` for your replies and injects them with `tmux send-keys`.
+- **`run`** (the daemon). Does the privileged work: it (a) sends queued requests
+  via Messages and records each sent message's `guid` against the tmux pane it
+  came from, and (b) polls `chat.db` for your replies and injects them with
+  `tmux send-keys`.
+
+`brew services` doesn't run the daemon directly: it runs **`ccim-launcher`**, a
+tiny frozen binary that starts the daemon as its child. macOS attributes the
+child's privileged work to the launcher's never-changing code identity, so you
+grant Full Disk Access and Automation to the launcher once and they survive
+every cc-imessage upgrade. (Self-signed certs with a stable designated
+requirement do not carry TCC grants across builds; we tested.)
+
+The messaging medium sits behind a small transport interface (`send`,
+`find_sent_id`, `poll`); iMessage is the built-in default, and a different
+medium (a bot API, say) is one new transport class that needs no Apple
+permissions at all.
 
 When you long-press a summary and tap **Reply**, that reply carries the `guid` of
 what it answered, so it routes back to the exact pane, no prefixes to type. A
@@ -46,14 +58,14 @@ brew services start genkio/tap/cc-imessage   # the daemon
    Settings > Messages > Send & Receive > "Start new conversations from" (a phone
    number in E.164 like `+15551234567`, or an Apple ID email). If they can arrive
    under more than one address, comma-separate them: `PHONE="+1555…,you@me.com"`.
-2. **Full Disk Access** so the daemon can read `chat.db`. Grant it to the binary
-   itself (its own code identity, nothing else inherits it):
-   `/opt/homebrew/opt/cc-imessage/bin/cc-imessage`
+2. **Full Disk Access** so the daemon can read `chat.db`. Grant it to the
+   launcher (its own code identity, nothing else inherits it):
+   `/opt/homebrew/var/cc-imessage/ccim-launcher`
    (System Settings > Privacy & Security > Full Disk Access > `+`, Cmd+Shift+G to
-   type the path).
-3. **Automation.** The first outbound send pops "cc-imessage wants to control
+   type the path). Then `brew services restart genkio/tap/cc-imessage`.
+3. **Automation.** The first outbound send pops "ccim-launcher wants to control
    Messages", click **Allow**. That's the send permission, also scoped to the
-   binary.
+   launcher.
 4. **Outbound hook.** Add a Claude Code Stop hook. The guard makes it a harmless
    no-op on machines where cc-imessage isn't installed yet:
    ```json
@@ -63,10 +75,11 @@ brew services start genkio/tap/cc-imessage   # the daemon
    ] } ] } }
    ```
 
-Grants persist across `brew upgrade`: the binary is signed with a self-signed
-cert (see `scripts/make-signing-cert.sh`), so its designated requirement keys on
-the cert rather than the per-build hash. You grant FDA + Automation once per
-machine, not once per release.
+Grants persist across `brew upgrade` because they attach to the launcher, whose
+bytes never change between cc-imessage releases (it lives under Homebrew's
+`var/`, untouched by upgrades). You grant FDA + Automation once per machine; a
+re-grant is only ever needed if the launcher itself releases a new version,
+which is intended to be ~never.
 
 ### Restoring on a new machine
 
@@ -94,8 +107,9 @@ context); from a plain shell they'll be denied unless that shell has FDA.
 Make targets wrap the script for local runs:
 
 ```sh
-make build    # compile the standalone binary (signs it if the cert exists)
-make run      # daemon; append to ~/.cc-imessage/bridge.log, open lnav if present
+make build           # compile the cc-imessage binary
+make build-launcher  # compile ccim-launcher; ONLY when its version bumps (costs everyone a re-grant)
+make run             # daemon; append to ~/.cc-imessage/bridge.log, open lnav if present
 make poll
 make map
 make send TO=+1555… TEXT="hi"
@@ -109,16 +123,16 @@ make send TO=+1555… TEXT="hi"
 |-----|---------|---------|
 | `PHONE` | (empty) | your phone's handle(s), comma-separated; empty disables the bridge |
 | `IMSG_OUT` | 1 | send a summary on each reply (0 disables outbound; takes effect next reply, no restart) |
-| `IMSG_SUMMARIZE` | 1 | summarize replies over the threshold with Haiku |
-| `IMSG_SUMMARIZE_MIN` | 400 | char threshold for summarizing |
+| `IMSG_SUMMARIZE` | 1 | rewrite each reply for speech with Haiku |
 | `IMSG_POLL_INTERVAL` | 1.5 | inbound poll cadence, seconds |
 | `IMSG_FALLBACK_LAST` | 1 | route non-reply messages to the last active session |
+| `CCIM_TRANSPORT` | imessage | messaging medium (only `imessage` is built in today) |
 
 ## Limitations
 
 - macOS only, tmux only. Sessions outside tmux can't be routed to.
-- Prebuilt binary is arm64; on Intel, `make build` (needs the signing cert for
-  persistent grants, else it's left adhoc).
+- Prebuilt binaries are arm64; on Intel, `make build` + `make build-launcher`
+  and grant FDA/Automation to your local launcher build.
 - Text extraction covers ordinary messages; rich/edited messages may need
   `imessage-exporter` for perfect fidelity.
 - Sends via AppleScript; if it errors, use the full E.164 handle and make sure
